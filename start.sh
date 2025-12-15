@@ -1,0 +1,1 @@
+/home/w/anaconda3/envs/vllm-env/bin/python vllm_server.py --model Qwen/Qwen3-0.6B --port 8000

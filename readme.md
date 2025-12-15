@@ -37,13 +37,13 @@ conda deactivate
 	然后安装 vLLM 及常用依赖：
 
 	```bash
-	pip install vllm fastapi requests pydantic
+	/home/w/anaconda3/envs/vllm-env/bin/pip install vllm fastapi requests pydantic
 	```
 
 - 纯 CPU（无 GPU）
 
 	```bash
-	pip install vllm fastapi requests pydantic
+	/home/w/anaconda3/envs/vllm-env/bin/pip install vllm fastapi requests pydantic
 	```
 
 ## 3. 运行与更多信息

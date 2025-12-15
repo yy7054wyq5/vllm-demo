@@ -1,56 +1,92 @@
 import argparse
-from vllm.entrypoints.openai import api_server
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict
+from vllm import LLM, SamplingParams
 
-def start_vllm_server(
-    model_name: str = "Qwen/Qwen-1.8B-Chat",  # 轻量中文模型，适合POC
-    host: str = "0.0.0.0",
-    port: int = 8000,
-    gpu_memory_utilization: float = 0.8,
-    max_num_batched_tokens: int = 1024,
-    enable_streaming: bool = True
-):
-    """启动vLLM OpenAI兼容API服务"""
-    # 1. 配置引擎参数
-    engine_args = AsyncEngineArgs(
-        model=model_name,
-        host=host,
-        port=port,
-        gpu_memory_utilization=gpu_memory_utilization,  # 显存利用率（CPU可忽略）
-        max_num_batched_tokens=max_num_batched_tokens,  # 批处理最大token数
-        tensor_parallel_size=1,  # 单GPU（多GPU可调整）
-        load_in_4bit=True,  # 4bit量化，降低显存占用（CPU/GPU都适用）
-        trust_remote_code=True,  # 加载自定义模型（如Qwen/ChatGLM）需开启
-    )
+# 初始化FastAPI应用
+app = FastAPI(title="vLLM AI API Server", version="1.0")
+llm = None  # 全局LLM引擎实例
+sampling_params = None  # 全局采样参数
 
-    # 2. 初始化异步引擎
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+# 定义请求体格式（兼容OpenAI格式）
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    temperature: float = 0.7
+    max_tokens: int = 512
+    stream: bool = False
 
-    # 3. 启动OpenAI兼容API服务
-    print(f"🚀 启动vLLM服务：模型={model_name}，地址=http://{host}:{port}")
-    print(f"📌 API兼容OpenAI格式，支持 /v1/chat/completions /v1/models 等接口")
-    api_server.run_server(
-        engine=engine,
-        engine_args=engine_args,
-        host=host,
-        port=port,
-        allow_credentials=True,
-        enable_streaming=enable_streaming  # 开启流式响应
-    )
+# 健康检查接口
+@app.get("/health")
+async def health_check():
+    if llm is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    return {
+        "status": "running",
+        "model": llm.model_config.model,
+        "gpu_memory_utilization": llm.engine_args.gpu_memory_utilization
+    }
 
-if __name__ == "__main__":
-    # 命令行参数解析（方便快速切换模型/端口）
-    parser = argparse.ArgumentParser(description="vLLM OpenAI API POC Server")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen-1.8B-Chat", 
-                        help="模型名称（HF仓库名，如Llama-3-8B-Instruct、ChatGLM3-6B）")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="绑定地址")
-    parser.add_argument("--port", type=int, default=8000, help="端口")
+# 核心聊天接口（非流式）
+@app.post("/v1/chat/completions")
+async def chat_completion(req: ChatRequest):
+    try:
+        # 提取用户最后一条消息（兼容多轮对话）
+        user_prompt = req.messages[-1]["content"]
+        # 设置采样参数
+        params = SamplingParams(
+            temperature=req.temperature,
+            max_tokens=req.max_tokens
+        )
+        # 推理生成
+        outputs = llm.generate([user_prompt], params)
+        response_text = outputs[0].outputs[0].text
+        
+        # 兼容OpenAI响应格式
+        return {
+            "id": f"cmpl-{outputs[0].request_id}",
+            "object": "chat.completion",
+            "created": int(outputs[0].created_time.timestamp()),
+            "model": llm.model_config.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": len(outputs[0].prompt_token_ids),
+                "completion_tokens": len(outputs[0].outputs[0].token_ids),
+                "total_tokens": len(outputs[0].prompt_token_ids) + len(outputs[0].outputs[0].token_ids)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+def main():
+    parser = argparse.ArgumentParser(description="vLLM FastAPI Server (All Versions)")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name/path")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=8000, help="Port")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="GPU memory utilization")
     args = parser.parse_args()
 
-    # 启动服务
-    start_vllm_server(
-        model_name=args.model,
-        host=args.host,
-        port=args.port
+    # 全局初始化LLM引擎（所有vLLM版本通用）
+    global llm
+    llm = LLM(
+        model=args.model,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=1,
+        trust_remote_code=True
     )
+
+    # 启动FastAPI服务
+    print(f"🚀 vLLM FastAPI Server started: http://{args.host}:{args.port}")
+    print(f"📌 Model: {args.model}")
+    uvicorn.run(app, host=args.host, port=args.port)
+
+if __name__ == "__main__":
+    main()
